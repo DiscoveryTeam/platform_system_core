@@ -56,20 +56,22 @@ static pthread_once_t the_once = PTHREAD_ONCE_INIT;
 
 static int __sys_supports_schedgroups = -1;
 
-#ifdef USE_CPUSETS
+// File descriptors open to /dev/cpuctl/../tasks, setup by initialize, or -1 on error.
+static int bg_cgroup_fd = -1;
+static int fg_cgroup_fd = -1;
+
 // File descriptors open to /dev/cpuset/../tasks, setup by initialize, or -1 on error
 static int system_bg_cpuset_fd = -1;
 static int bg_cpuset_fd = -1;
 static int fg_cpuset_fd = -1;
 static int ta_cpuset_fd = -1; // special cpuset for top app
-#endif
+static int system_bg_schedboost_fd = -1;
 
 // File descriptors open to /dev/stune/../tasks, setup by initialize, or -1 on error
 static int bg_schedboost_fd = -1;
 static int fg_schedboost_fd = -1;
 static int ta_schedboost_fd = -1;
 
-#if defined(USE_CPUSETS) || defined(USE_SCHEDBOOST)
 /* Add tid to the scheduling group defined by the policy */
 static int add_tid_to_cgroup(int tid, int fd)
 {
@@ -104,39 +106,89 @@ static int add_tid_to_cgroup(int tid, int fd)
 
     return 0;
 }
-#endif //defined(USE_CPUSETS) || defined(USE_SCHEDBOOST)
 
-static void __initialize(void) {
-    if (!access("/dev/cpuctl/tasks", F_OK)) {
+/*
+    If CONFIG_CPUSETS for Linux kernel is set, "tasks" can be found under
+    /dev/cpuset mounted in init.rc; otherwise, that file does not exist
+    even though the directory, /dev/cpuset, is still created (by init.rc).
+    A couple of other candidates (under cpuset mount directory):
+        notify_on_release
+        release_agent
+    Yet another way to decide if cpuset is enabled is to parse
+    /proc/self/status and search for lines begin with "Mems_allowed".
+    If CONFIG_PROC_PID_CPUSET is set, the existence "/proc/self/cpuset" can
+    be used to decide if CONFIG_CPUSETS is set, so we don't have a dependency
+    on where init.rc mounts cpuset. That's why we'd better require this
+    configuration be set if CONFIG_CPUSETS is set.
+    With runtime check using the following function, build time
+    variables like ENABLE_CPUSETS (used in Android.mk) or cpusets (used
+    in Android.bp) are not needed.
+ */
+
+bool cpusets_enabled() {
+    static bool enabled = (access("/dev/cpuset/tasks", F_OK) == 0);
+
+    return enabled;
+}
+
+/*
+    Similar to CONFIG_CPUSETS above, but with a different configuration
+    CONFIG_SCHEDTUNE that's in Android common Linux kernel and Linaro
+    Stable Kernel (LSK), but not in mainline Linux as of v4.9.
+    With runtime check using the following function, build time
+    variables like ENABLE_SCHEDBOOST (used in Android.mk) or schedboost
+    (used in Android.bp) are not needed.
+ */
+
+bool schedboost_enabled() {
+    static bool enabled = (access("/dev/stune/tasks", F_OK) == 0);
+
+    return enabled;
+}
+
+static void __initialize() {
+    const char* filename;
+    if (!access("/dev/cpuctl/tasks", W_OK)) {
         __sys_supports_schedgroups = 1;
+
+        filename = "/dev/cpuctl/tasks";
+        fg_cgroup_fd = open(filename, O_WRONLY | O_CLOEXEC);
+        if (fg_cgroup_fd < 0) {
+            SLOGE("open of %s failed: %s\n", filename, strerror(errno));
+        }
+
+        filename = "/dev/cpuctl/bg_non_interactive/tasks";
+        bg_cgroup_fd = open(filename, O_WRONLY | O_CLOEXEC);
+        if (bg_cgroup_fd < 0) {
+            SLOGE("open of %s failed: %s\n", filename, strerror(errno));
+        }
     } else {
         __sys_supports_schedgroups = 0;
     }
 
-#ifdef USE_CPUSETS
-    if (!access("/dev/cpuset/tasks", F_OK)) {
-        char* filename;
-        filename = "/dev/cpuset/foreground/tasks";
-        fg_cpuset_fd = open(filename, O_WRONLY | O_CLOEXEC);
-        filename = "/dev/cpuset/background/tasks";
-        bg_cpuset_fd = open(filename, O_WRONLY | O_CLOEXEC);
-        filename = "/dev/cpuset/system-background/tasks";
-        system_bg_cpuset_fd = open(filename, O_WRONLY | O_CLOEXEC);
-        filename = "/dev/cpuset/top-app/tasks";
-        ta_cpuset_fd = open(filename, O_WRONLY | O_CLOEXEC);
+    if (cpusets_enabled()) {
+        if (!access("/dev/cpuset/tasks", W_OK)) {
+
+            filename = "/dev/cpuset/foreground/tasks";
+            fg_cpuset_fd = open(filename, O_WRONLY | O_CLOEXEC);
+            filename = "/dev/cpuset/background/tasks";
+            bg_cpuset_fd = open(filename, O_WRONLY | O_CLOEXEC);
+            filename = "/dev/cpuset/system-background/tasks";
+            system_bg_cpuset_fd = open(filename, O_WRONLY | O_CLOEXEC);
+            filename = "/dev/cpuset/top-app/tasks";
+            ta_cpuset_fd = open(filename, O_WRONLY | O_CLOEXEC);
+
+            if (schedboost_enabled()) {
+                filename = "/dev/stune/top-app/tasks";
+                ta_schedboost_fd = open(filename, O_WRONLY | O_CLOEXEC);
+                filename = "/dev/stune/foreground/tasks";
+                fg_schedboost_fd = open(filename, O_WRONLY | O_CLOEXEC);
+                filename = "/dev/stune/background/tasks";
+                bg_schedboost_fd = open(filename, O_WRONLY | O_CLOEXEC);
+            }
+        }
     }
 
-#ifdef USE_SCHEDBOOST
-    if (!access("/dev/stune/tasks", F_OK)) {
-        filename = "/dev/stune/top-app/tasks";
-        ta_schedboost_fd = open(filename, O_WRONLY | O_CLOEXEC);
-        filename = "/dev/stune/foreground/tasks";
-        fg_schedboost_fd = open(filename, O_WRONLY | O_CLOEXEC);
-        filename = "/dev/stune/background/tasks";
-        bg_schedboost_fd = open(filename, O_WRONLY | O_CLOEXEC);
-    }
-#endif /* USE_SCHEDBOOST */
-#endif /* USE_CPUSETS */
 }
 
 /*
@@ -220,33 +272,34 @@ int get_sched_policy(int tid, SchedPolicy *policy)
 
     if (__sys_supports_schedgroups) {
         char grpBuf[32];
-#ifdef USE_CPUSETS
-        if (getCGroupSubsys(tid, "cpuset", grpBuf, sizeof(grpBuf)) < 0)
-            return -1;
-        if (grpBuf[0] == '\0') {
-            *policy = SP_FOREGROUND;
-        } else if (!strcmp(grpBuf, "foreground")) {
-            *policy = SP_FOREGROUND;
-        } else if (!strcmp(grpBuf, "background")) {
-            *policy = SP_BACKGROUND;
-        } else if (!strcmp(grpBuf, "top-app")) {
-            *policy = SP_TOP_APP;
+
+        if (cpusets_enabled()) {
+            if (getCGroupSubsys(tid, "cpuset", grpBuf, sizeof(grpBuf)) < 0)
+                return -1;
+            if (grpBuf[0] == '\0') {
+                *policy = SP_FOREGROUND;
+            } else if (!strcmp(grpBuf, "foreground")) {
+                *policy = SP_FOREGROUND;
+            } else if (!strcmp(grpBuf, "background")) {
+                *policy = SP_BACKGROUND;
+            } else if (!strcmp(grpBuf, "top-app")) {
+                *policy = SP_TOP_APP;
+            } else {
+                errno = ERANGE;
+                return -1;
+            }
         } else {
-            errno = ERANGE;
-            return -1;
+            if (getCGroupSubsys(tid, "cpu", grpBuf, sizeof(grpBuf)) < 0)
+                return -1;
+            if (grpBuf[0] == '\0') {
+                *policy = SP_FOREGROUND;
+            } else if (!strcmp(grpBuf, "bg_non_interactive")) {
+                *policy = SP_BACKGROUND;
+            } else {
+                errno = ERANGE;
+                return -1;
+            }
         }
-#else
-        if (getCGroupSubsys(tid, "cpu", grpBuf, sizeof(grpBuf)) < 0)
-            return -1;
-        if (grpBuf[0] == '\0') {
-            *policy = SP_FOREGROUND;
-        } else if (!strcmp(grpBuf, "bg_non_interactive")) {
-            *policy = SP_BACKGROUND;
-        } else {
-            errno = ERANGE;
-            return -1;
-        }
-#endif
     } else {
         int rc = sched_getscheduler(tid);
         if (rc < 0)
@@ -255,10 +308,6 @@ int get_sched_policy(int tid, SchedPolicy *policy)
             *policy = SP_FOREGROUND;
         else if (rc == SCHED_BATCH)
             *policy = SP_BACKGROUND;
-/* BEGIN Motorola, rknize2, 05/10/2013, IKJBXLINE-9555 */
-        else if (rc == SCHED_RR)
-            *policy = SP_REALTIME;
-/* END Motorola, IKJBXLINE-9555 */
         else {
             errno = ERANGE;
             return -1;
@@ -270,9 +319,10 @@ int get_sched_policy(int tid, SchedPolicy *policy)
 int set_cpuset_policy(int tid, SchedPolicy policy)
 {
     // in the absence of cpusets, use the old sched policy
-#ifndef USE_CPUSETS
-    return set_sched_policy(tid, policy);
-#else
+    if (!cpusets_enabled()) {
+        return set_sched_policy(tid, policy);
+    }
+
     if (tid == 0) {
         tid = gettid();
     }
@@ -298,6 +348,7 @@ int set_cpuset_policy(int tid, SchedPolicy policy)
         break;
     case SP_SYSTEM:
         fd = system_bg_cpuset_fd;
+        boost_fd = system_bg_schedboost_fd;
         break;
     default:
         boost_fd = fd = -1;
@@ -309,15 +360,14 @@ int set_cpuset_policy(int tid, SchedPolicy policy)
             return -errno;
     }
 
-#ifdef USE_SCHEDBOOST
-    if (boost_fd > 0 && add_tid_to_cgroup(tid, boost_fd) != 0) {
-        if (errno != ESRCH && errno != ENOENT)
-            return -errno;
+    if (schedboost_enabled()) {
+        if (boost_fd > 0 && add_tid_to_cgroup(tid, boost_fd) != 0) {
+            if (errno != ESRCH && errno != ENOENT)
+                return -errno;
+        }
     }
-#endif
 
     return 0;
-#endif
 }
 
 int set_sched_policy(int tid, SchedPolicy policy)
@@ -364,11 +414,6 @@ int set_sched_policy(int tid, SchedPolicy policy)
     case SP_SYSTEM:
         SLOGD("/// tid %d (%s)", tid, thread_name);
         break;
-/* BEGIN Motorola, rknize2, 05/10/2013, IKJBXLINE-9555 */
-    case SP_REALTIME:
-        SLOGD("!!! tid %d (%s)", tid, thread_name);
-        break;
-/* END Motorola, IKJBXLINE-9555 */
     default:
         SLOGD("??? tid %d (%s)", tid, thread_name);
         break;
@@ -376,47 +421,48 @@ int set_sched_policy(int tid, SchedPolicy policy)
 #endif
 
     if (__sys_supports_schedgroups) {
+        int fd = -1;
         int boost_fd = -1;
         switch (policy) {
         case SP_BACKGROUND:
+            fd = bg_cgroup_fd;
             boost_fd = bg_schedboost_fd;
             break;
         case SP_FOREGROUND:
         case SP_AUDIO_APP:
         case SP_AUDIO_SYS:
+            fd = fg_cgroup_fd;
             boost_fd = fg_schedboost_fd;
             break;
         case SP_TOP_APP:
+            fd = fg_cgroup_fd;
             boost_fd = ta_schedboost_fd;
             break;
         default:
+            fd = -1;
             boost_fd = -1;
             break;
         }
 
-#ifdef USE_SCHEDBOOST
-        if (boost_fd > 0 && add_tid_to_cgroup(tid, boost_fd) != 0) {
+        if (fd > 0 && add_tid_to_cgroup(tid, fd) != 0) {
             if (errno != ESRCH && errno != ENOENT)
                 return -errno;
         }
-#endif
+
+        if (schedboost_enabled()) {
+            if (boost_fd > 0 && add_tid_to_cgroup(tid, boost_fd) != 0) {
+                if (errno != ESRCH && errno != ENOENT)
+                    return -errno;
+            }
+        }
     } else {
         struct sched_param param;
-/* BEGIN Motorola, rknize2, 05/10/2013, IKJBXLINE-9555
- * Allow the RT policy at the lowest priority. */
-        int posix_policy = SCHED_NORMAL;
 
-        param.sched_priority = 0; /* unused for non-RT policies */
-        if (policy == SP_BACKGROUND) {
-            posix_policy = SCHED_BATCH;
-        } else if (policy == SP_REALTIME) {
-            posix_policy = SCHED_RR;
-            param.sched_priority = 1; /* lowest RT priority */
-        }
-
-        if (sched_setscheduler(tid, posix_policy, &param) < 0)
-            SLOGE("sched_setscheduler failed: tid %d, errno=%d", tid, errno);
-/* END Motorola, IKJBXLINE-9555 */
+        param.sched_priority = 0;
+        sched_setscheduler(tid,
+                           (policy == SP_BACKGROUND) ?
+                           SCHED_BATCH : SCHED_NORMAL,
+                           &param);
     }
 
     prctl(PR_SET_TIMERSLACK_PID,
@@ -452,7 +498,6 @@ const char *get_sched_policy_name(SchedPolicy policy)
        [SP_AUDIO_APP]  = "aa",
        [SP_AUDIO_SYS]  = "as",
        [SP_TOP_APP]    = "ta",
-       [SP_REALTIME]   = "rt", /* Motorola, w04904, 05/10/2013, IKJBXLINE-9555 */
     };
     if ((policy < SP_CNT) && (strings[policy] != NULL))
         return strings[policy];
